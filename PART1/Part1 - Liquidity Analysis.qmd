@@ -1,0 +1,601 @@
+---
+title: 'SMM921 Coursework: Trading and Market Microstructure'
+date: today
+format:
+  pdf:
+    keep-ipynb: true
+    include-in-header:
+      text: |
+        \usepackage{etoolbox}
+        \AtBeginEnvironment{longtable}{\footnotesize}
+        \AtBeginEnvironment{tabular}{\footnotesize}
+        \renewcommand{\arraystretch}{0.9}
+        \usepackage{fancyhdr}
+        \pagestyle{fancy}
+        \fancyhf{}
+        \fancyhead[L]{SMM921 Coursework}
+        \fancyhead[R]{Group 19}
+        \fancyfoot[C]{\thepage}
+    documentclass: article
+    papersize: a4
+    geometry: margin=0.9in
+    fontsize: 12pt
+    linestretch: 1.25
+    number-sections: true
+    colorlinks: false
+    fig-pos: H
+    fig-align: center
+    tbl-cap-location: top
+    fig-format: png
+    fig-dpi: 500
+    embed-resources: true
+    highlight-style: none
+    bibliography: references.bib
+    csl: harvard-cite-them-right.csl
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+
+jupyter: python3
+---
+
+# Liquidity Analysis
+
+We analyse one-minute trading data for three London-listed stocks and study their liquidity from a quantitative trader's point of view. The goal of our task is to build liquidity measures and compare the average liquidity across these chosen stocks, in order to look at how liquidity moves through the trading day, and finally test how daily it relates to daily volatility.
+
+The three stocks are AZN.L (AstraZeneca, large-cap), NXT.L (Next, mid-cap) and BRBY.L (Burberry, small-cap). Picking one stock from each size group gives a clear contrast in liquidity; a larger stock such as AstraZeneca is usually traded by institutional investors and funds, thus sees more frequent trading and consequent tighter spreads. Whereas, a smaller stock such as Burberry may express wider spreads and lower depth for contrary reasons. Therefore, choosing one of each size allows the depiction of variation in liquidity conditions within our analysis.
+
+## Setup & Stock Selection
+
+We use pandas and numpy for the data work, matplotlib and seaborn for the charts, statsmodels for the OLS regressions, and scipy for the correlation tests. Prices in the file are quoted in pence (GBp), which matters when we convert depth into pounds later.
+The three stocks are AZN.L (AstraZeneca, large-cap), NXT.L (Next, mid-cap) and BRBY.L (Burberry, small-cap). Picking one stock from each size group gives a clear contrast in liquidity; a larger stock such as AstraZeneca is usually traded by institutional investors and funds, thus sees more frequent trading and consequent tighter spreads. Whereas, a smaller stock such as Burberry may express wider spreads and lower depth for contrary reasons. Therefore, choosing one of each size allows the depiction of variation in liquidity conditions within our analysis, these three stocks are also operating in different sectors ensuring even more diversity in our comparison
+
+```{python}
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import seaborn as sns
+import statsmodels.api as sm
+from scipy import stats
+from datetime import time
+import ptitprince as pt
+
+
+sns.set_style("whitegrid")
+plt.rcParams.update({"figure.dpi": 300, "axes.titlesize": 12})
+
+# the three chosen stocks, ordered large -> mid -> small cap
+chosen_stocks = ["AZN.L", "NXT.L", "BRBY.L"]
+
+COLOURS = {"AZN.L": "#007D8A", "NXT.L": "#2A2A2A", "BRBY.L": "#C5B396"}  
+
+STOCK_INFO = {
+    "AZN.L":  dict(name="AstraZeneca plc",    cap="Large-cap", sector="Pharmaceuticals"),
+    "NXT.L":  dict(name="Next plc",           cap="Mid-cap",   sector="Retail / Clothing"),
+    "BRBY.L": dict(name="Burberry Group plc", cap="Small-cap", sector="Luxury / Fashion"),
+}
+
+# df = pd.read_csv(r"C:\Users\User\Desktop\SMM921_trading_data_2026.csv")
+df = pd.read_csv("SMM921_trading_data_2026.csv")
+
+df = df[df["Stock"].isin(chosen_stocks)].copy()
+df["Date and time"] = pd.to_datetime(df["Date and time"])
+df["Date"] = df["Date and time"].dt.date
+
+# count crossed/locked quotes (ask <= bid) across ALL hours, before any filtering
+crossed_all = int(((df["Ask"] - df["Bid"]) / ((df["Bid"] + df["Ask"]) / 2) <= 0).sum())
+
+```
+
+```{python}
+#| tbl-cap: Stock selection by market capitalisation and sectors
+# Fixing the IndentationError by restructuring the list comprehension and method chaining
+# We preserve existing variables and dependencies.
+
+# Recreate the selection DataFrame correctly
+selection = pd.DataFrame([
+    {
+        "Ticker": t,
+        "Company": STOCK_INFO[t]["name"],
+        "Market-cap class": STOCK_INFO[t]["cap"],
+        "Sector": STOCK_INFO[t]["sector"],
+    }
+    for t in chosen_stocks
+]).set_index("Ticker")
+
+selection
+```
+
+## Liquidity Measures
+
+For every minute we build the standard microstructure measures; the quotes spread and the depths. These measures capture different dimensions of liquidity, as the spread displays the cost of execution whilst the depth displays the quantity available at the best price. This is important to establish, as @harris2003 establishes how liquidity is "multi-dimensional"; liquidity is not measured via one number but rather through 'width, depth, and immediacy'.
+
+**Mid-quote** (in pence), the fair-value proxy halfway between the best bid and ask:$m_t = \tfrac{1}{2}\,(\text{Bid}_t + \text{Ask}_t)$
+
+The midquote is important as it is our proxy of the stock's fair value, sitting between the immediate sale and immediate buy prices. This is useful as compared to using transaction prices as this diminishes bid - ask bounce.
+
+**Quoted spread** in basis points, the cost of crossing the touch: $s_t = \frac{\text{Ask}_t - \text{Bid}_t}{m_t}\times 10000$
+
+A wider spread may indicate a higher immediacy cost, as a trader who buys immediately will pay the asking price and vice versa. A lower spread inversely implies cheaper execution This, therefore, demonstrates the cost of trading.
+
+**Depth at best** in pounds. Because prices are in pence, we divide by 100 to express it in GBP: $D = \tfrac{1}{2}\,\big(P_\text{Bid}\cdot\ Q_\text{Bid} + P_\text{Ask}\cdot\ Q_\text{Ask}\big)\,/\,100$
+
+Depth tells us roughly how much can be traded at the touch before the price has to move. Higher depth means a trader is able to execute a larger order at the best price before having to pay a the next best available price.
+
+### Measure Connotations
+
+With the mid-quote, spread and depth built for every minute, one data issue already stands out. Across the full feed there are 2,776 quotes where the ask is at or below the bid, which produces a zero or negative spread. These are not genuine trading costs, and as the next section shows almost all of them sit in the pre-open window. We remove them in the cleaning step before comparing the stocks.
+
+```{python}
+df["Midquote"]   = (df["Bid"] + df["Ask"]) / 2                          # pence
+df["Spread_bps"] = (df["Ask"] - df["Bid"]) / df["Midquote"] * 10000
+df["Midquote_GBP"] = df["Midquote"] / 100  # pounds
+df["Depth"]      = (df["Bid"]*df["Bid size"] + df["Ask"]*df["Ask size"]) / 2 / 100   # GBP
+
+# how many crossed or locked quotes (ask <= bid) are in the raw feed, across all hours?
+```
+
+### Negative & Crossed Spreads
+
+A spread of zero or below means the ask is at or under the bid, which should not happen in a normal book. After the trading-hours filter only a handful of these remain, and we drop them.
+
+```{python}
+n_crossed = int((df["Spread_bps"] <= 0).sum())
+df = df[df["Spread_bps"] > 0].copy()
+```
+
+After the trading-hours and crossed-quote filters, the clean sample has **93,088 observations** across the three stocks and 64 trading days. No further observations were removed.
+
+### Mid-quote Returns
+
+We compute one-minute mid-quote returns within each stock-day, so the overnight gap between the close of one day and the open of the next is never treated as a one-minute move: $r_t = \frac{m_t - m_{t-1}}{m_{t-1}} \times 10000$
+Returns are reported in basis points. The mean return is close to zero and the median is exactly zero, which is what we expect at the one-minute frequency. This is because at a one-minute frequency, most individual price changes are tiny, to the point of indifference and no change at all. Therefore if the midquote is unchanged from one minute to the next, the return is approximately 0 basis points regardless.
+
+```{python}
+#| tbl-cap: descriptive stats for midquote Returns
+df = df.sort_values(["Stock", "Date and time"]).reset_index(drop=True)
+df["Midquote_Return"] = df.groupby(["Stock", "Date"])["Midquote"].pct_change()
+df["Ret_bps"] = df["Midquote_Return"] * 10000
+# Median number of 1-min observations per trading day, per stock
+per_day = df.groupby(["Stock", "Date"]).size().median()
+PERIODS_PER_YEAR = per_day * 252   # 252 trading days/year
+
+summary = df.groupby("Stock")["Ret_bps"].agg(["mean", "std", "min", "max"])
+summary["sharpe"] = (
+    summary["mean"] / summary["std"] * (PERIODS_PER_YEAR ** 0.5)
+).round(3)
+summary.round(2)
+```
+
+## Data Cleaning & Trading Filters
+
+We clean the intraday data to ensure that measures reflect continuos trading with normality; we drop crossed quotes and check for outliers. This is important to establish consistency in an analysis that is dependent on high frequency observations (one-minute) and thus one small error in depth, for example, can affect average spreads, depth and consequently returns. 
+
+Furthermore, We keep observations between 08:15 and 16:25. Most of the crossed quotes counted sit in the pre-open window, so this filter removes the bulk of them on its own. Then, the remaining data is inspected to observe for outliers and ultimately record the removal of implausible observations.
+
+```{python}
+df["Time"] = df["Date and time"].dt.time
+before = len(df)
+df = df[(df["Time"] >= time(8, 15)) & (df["Time"] <= time(16, 25))].copy()
+```
+
+## Price Overview
+
+Before looking at liquidity, it helps to see how prices moved over the sample. The candlestick charts below summarise each trading day using the mid-quote (in pounds): the wick shows the daily high and low, and the body shows the open-to-close move. Green days closed up, red days closed down.
+The charts depict how the three stocks have noticeably different price ranges and behaviour. AZN.L for example, has the highest price level and appears to be the most recoverable and resilient over time. Although there are some significant moves throughout, the overall pattern is quite steady.
+On the other hand, NXT.L shows a downward trend. The stock depletes around 15-20 GBP before stabilising, followed by another reduction to 120 GBP. This is a more volatile pattern that demonstrates a harsher trading environment, as highlighted via the several red candles.
+Lastly, BRBY.L has the lowest price level and ultimately the weakest performance; it is sensitive to several sharp daily moves and consequently falls to around 10 GBP.
+
+```{python}
+
+#| fig-cap: "Daily OHLC Candlesticks (mid-quote). Top to bottom; AstraZeneca, Next, and Burberry."
+fig, axes = plt.subplots(3, 1, figsize=(15, 9))
+for ax, stock in zip(axes, chosen_stocks):
+    s = (df.loc[df["Stock"] == stock, ["Date and time", "Midquote_GBP"]]
+           .set_index("Date and time").sort_index())
+    ohlc = s["Midquote_GBP"].resample("1D").ohlc().dropna().reset_index(drop=True)
+    for x, row in ohlc.iterrows():
+        up = row["close"] >= row["open"]
+        colour = "#2d6c3e" if up else "#8B0000"
+        ax.plot([x, x], [row["low"], row["high"]], color=colour, linewidth=0.9)
+        lower  = min(row["open"], row["close"])
+        height = abs(row["close"] - row["open"]) or (row["high"] - row["low"]) * 0.02
+        ax.add_patch(Rectangle((x - 0.3, lower), 0.6, height, facecolor=colour, edgecolor=colour))
+    ax.set_title(f"{stock} - {STOCK_INFO[stock]['name']}", loc="left")
+    ax.set_ylabel("Mid-quote (GBP)")
+    ax.set_xlim(-1, len(ohlc))
+axes[-1].set_xlabel("Trading day")
+fig.suptitle("Daily OHLC candlesticks (mid-quote)", fontweight="bold")
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| output: asis
+#| tbl-cap: Descriptive statistics for Spread, Returns, Depth and Volume
+metrics = {"Spread_bps": "Spread (bps)", "Ret_bps": "Return (bps)", "Depth": "Depth (£)", "Volume": "Volume (£)"}
+calcs = ["mean", "std", "min", "max"]
+
+summary_table = (
+    df.groupby("Stock")[list(metrics)]
+    .agg(calcs)
+    .round(2)
+)
+# columns are (metric, stat); stack the metric into rows to narrow it
+summary_table = summary_table.stack(level=0).rename_axis(["Stock", "Metric"])
+summary_table.columns = [c.capitalize() for c in summary_table.columns]
+summary_table
+
+# summary = df.groupby("Stock")["Ret_bps"].agg(["mean", "std", "min", "max"])
+# summary["sharpe"] = (summary["mean"] / summary["std"] * (PERIODS_PER_YEAR ** 0.5)).round(3)
+# summary.round(2).T   # stats as rows, 3 stock columns
+
+flat = summary_table.reset_index()
+# blank out repeated Stock labels so it still reads as grouped
+flat["Stock"] = flat["Stock"].mask(flat["Stock"].duplicated(), "")
+flat.to_markdown(index=False)
+print(flat.to_markdown(index=False))
+```
+
+### Mid-quote Return Summary
+
+The average one-minute return is almost exactly zero for all three stocks and the median is zero, which is what we expect at this frequency since the mid-quote often does not change from one minute to the next. The tails are wider for Burberry, whose returns range from about -119 to +209 bps, than for AstraZeneca or Next. That is an early sign that the small-cap is the most volatile of the three. We check these extreme values in the outlier step rather than dropping them automatically.
+
+
+### Outlier Analysis
+
+For the Outlier analysis, we aim to remove certain observations pre regression. The summary statistics show extreme values that fall within their ranges and are therefore plausible. This may be, for example, due to wider spreads and busier days. Therefore, these plausible values are kept
+
+### Summary statistics
+
+As demonstrated, spreads have a median of 7.5 basis points; there is a big range in depth, reaching 800,000 GBP; one-minute returns sit approximately at zero with no significant alterations. 
+
+```{python}
+def plot_violin_boxplot(y, title=None, log=False, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+    order = ['AZN.L', 'NXT.L', 'BRBY.L']
+
+    pt.half_violinplot(
+        x="Stock", y=y, data=df, order=order,
+        hue="Stock", palette=COLOURS,
+        bw=.2, cut=0, scale="area", inner=None, orient="v", ax=ax,
+    )
+    sns.boxplot(
+        data=df, x="Stock", y=y, order=order,
+        hue="Stock", palette=COLOURS, legend=False,
+        width=0.18, showcaps=True,
+        flierprops=dict(marker='o', markerfacecolor='black', markersize=2, linestyle='none'),
+        ax=ax,
+    )
+    if log:
+        ax.set_yscale("log")
+    ax.set_title(title or y.replace('_', ' '))
+    ax.set_xlabel("")
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
+
+
+# Plot all three liquidity metrics together so the contrast across stocks is obvious.
+#| fig-cap: "Liquidity and Volatility Distributions. From Left to Right; Quoted Spread, Depth at Best, and 1-Minute Returns."
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+plot_violin_boxplot("Spread_bps",  title="Quoted spread (bps) - lower is cheaper",  ax=axes[0])
+plot_violin_boxplot("Depth",       title="Depth at best (GBP, log) - higher is deeper", log=True, ax=axes[1])
+df["AbsRet_bps"] = df["Ret_bps"].abs()
+plot_violin_boxplot("AbsRet_bps",  title="|1-minute return| (bps) - higher is more volatile", ax=axes[2])
+axes[0].set_ylabel("Basis points")
+axes[1].set_ylabel("GBP (log scale)")
+axes[2].set_ylabel("Basis points")
+fig.suptitle("Liquidity and volatility distributions across the three stocks", fontweight="bold")
+plt.tight_layout(); plt.show()
+```
+
+## Average Liquidity
+
+When comparing average liquidity, average and median spread, average depth, and average absolute one-minute returns, the results are as shown in the graphs.
+
+
+```{python}
+#| fig-cap: Left to right, Charts consisting of Average Spread, Average Depth, and Average 1 Minute Returns for the three stocks (AstraZeneca, Next, and Burberry).
+liquidity_summary = df.groupby("Stock").agg(
+    Avg_Spread_bps    = ("Spread_bps", "mean"),
+    Median_Spread_bps = ("Spread_bps", "median"),
+    Avg_Depth_GBP     = ("Depth", "mean"),
+    Avg_AbsReturn_bps = ("Ret_bps", lambda s: s.abs().mean()),
+).reindex(chosen_stocks)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.5))
+colours = [COLOURS[s] for s in liquidity_summary.index]
+
+liquidity_summary["Avg_Spread_bps"].plot(kind="bar", ax=axes[0], color=colours)
+axes[0].set_title("Average spread (bps)"); axes[0].set_ylabel("Basis points")
+
+liquidity_summary["Avg_Depth_GBP"].plot(kind="bar", ax=axes[1], color=colours)
+axes[1].set_title("Average depth at best (GBP)"); axes[1].set_ylabel("GBP")
+
+liquidity_summary["Avg_AbsReturn_bps"].plot(kind="bar", ax=axes[2], color=colours)
+axes[2].set_title("Average |1-min return| (bps)"); axes[2].set_ylabel("Basis points")
+
+for ax in axes:
+    ax.tick_params(axis="x", rotation=0)
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| tbl-cap: Activity Measures and Descriptive Statistics for the three stocks (AstraZeneca, Next, and Burberry).
+# compact headline table, including activity measures
+headline = pd.DataFrame({s: {
+    "Avg spread (bps)":      df[df.Stock == s]["Spread_bps"].mean(),
+    "Median spread (bps)":   df[df.Stock == s]["Spread_bps"].median(),
+    "Avg depth (GBP)":       df[df.Stock == s]["Depth"].mean(),
+    "Avg |1-min ret| (bps)": df[df.Stock == s]["Ret_bps"].abs().mean(),
+    "Avg trades / min":      df[df.Stock == s]["Num. Trades"].mean(),
+    "% minutes traded":      100 * (df[df.Stock == s]["Num. Trades"].fillna(0) > 0).mean(),
+} for s in chosen_stocks}).round(2)
+headline
+```
+
+The rankings depicted are consistent; AZN.L is the most liquid with the tightest spread (approx 2.5 basis points) and the most active trading, as suspected. BRBY.L is the least liquid with a spread of approximately 14 basis points and much thinner depth. This matches the pattern that the larger, more active stocks are therefore easier to trade and ultimately cheaper than the smaller ones. Therefore, the cost and the size of the stocks are interrelated.
+
+## Intraday Liquidity Patterns
+
+Here we average each measure by time of day across all 64 days, which isolates the typical shape of the trading day. We look at spread, depth and volume.
+
+```{python}
+#| fig-cap: Left to right; Average Depth by Time of Day, and Average Volume by Time of Day.
+# Bin timestamps to a coarser interval (e.g. 15 min) before aggregating
+
+BIN = "15min"   # try "5min", "10min", "15min", "30min"
+df["TimeBin"] = df["Date and time"].dt.floor(BIN).dt.strftime("%H:%M")
+
+intraday = (df.groupby(["Stock", "TimeBin"])
+              .agg(Spread_bps=("Spread_bps", "mean"),
+                   Depth=("Depth", "mean"),
+                   Volume=("Volume", lambda s: s.fillna(0).mean()))
+              .reset_index())
+
+panels = [("Depth",      "Average depth (GBP)"),
+          ("Volume",     "Average volume (shares)")]
+
+times = sorted(intraday["TimeBin"].unique())
+step = max(1, len(times) // 10)
+
+# Create a single figure with 1 row and 2 columns
+# Increased figsize width to 16 to accommodate both plots comfortably side-by-side
+fig, axes = plt.subplots(1, 2, figsize=(15, 3.5)) 
+
+# zip(axes, panels) pairs the first axis with "Depth", and the second with "Volume"
+for ax, (col, ylabel) in zip(axes, panels):
+    for s in chosen_stocks:
+        sub = intraday[intraday["Stock"] == s].set_index("TimeBin").reindex(times).reset_index()
+        ax.plot(sub["TimeBin"], sub[col], color=COLOURS[s], label=s, linewidth=1.3)
+        
+    ax.set_title(f"{ylabel} by time of day")
+    ax.set_xlabel("Time of day")
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(range(0, len(times), step))
+    ax.set_xticklabels(times[::step], rotation=45)
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| fig-cap: 'Intraday day spread buckets; Left to Right: AstraZeneca, Next, and Burberry.'
+# 30-minute spread buckets, one panel per stock, to show the level differences clearly
+df["Bucket"] = df["Date and time"].dt.floor("30min").dt.strftime("%H:%M")
+bucket_spread = (df.groupby(["Stock", "Bucket"])
+                   .agg(Avg_Spread=("Spread_bps", "mean")).reset_index())
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.5))
+for i, s in enumerate(chosen_stocks):
+    sub = bucket_spread[bucket_spread["Stock"] == s]
+    axes[i].bar(sub["Bucket"], sub["Avg_Spread"], color=COLOURS[s], edgecolor="white", linewidth=0.4)
+    axes[i].set_title(s); axes[i].set_xlabel("Time of day")
+    axes[i].tick_params(axis="x", rotation=45)
+axes[0].set_ylabel("Average spread (bps)")
+fig.suptitle("Intraday spread pattern by stock", fontweight="bold")
+plt.tight_layout(); plt.show()
+```
+
+The shape is the same for all three stocks, only the level differs. Spreads are widest right after the open, when there is still uncertainty from overnight news and the book is thin, and they tighten steadily as the session goes on. Depth moves the other way: it is lowest at the open and builds up through the day, reaching its highest level into the close. The decline in spreads continues all the way into the close rather than turning back up, which fits the way liquidity concentrates around the closing auction on the LSE. As described per @Mcinish1992, this pattern is consistent with the idea that information is progressive.
+
+Therefore, the takeaway is to avoid sending large or cost-sensitive orders in the first 30 to 45 minutes, and to lean on the deeper, cheaper later part of the day. The penalty for trading at the open is largest in the least liquid name, Burberry, whose opening spread is both the widest and the most elevated relative to its own daily average.
+
+## Daily Liquidity & Volatility
+
+The brief defines **daily volatility** as the mean of the absolute one-minute mid-quote returns within a day:
+$$\sigma_d = \frac{1}{N_d}\sum_{t \in d} |r_t|$$
+We aggregate the minute-level data to one observation per stock-day, then study how daily spread relates to daily volatility using correlations and an OLS regression.
+
+```{python}
+#| output: asis
+#| tbl-cap: descriptive statistics for spread depth and absolute returns
+daily = (df.groupby(["Stock", "Date"])
+           .agg(Daily_Spread     = ("Spread_bps", "mean"),
+                Daily_Depth      = ("Depth", "mean"),
+                Daily_Volatility = ("Ret_bps", lambda s: s.abs().mean()))   # mean |1-min return|, bps
+           .reset_index())
+metrics_daily = {
+    "Daily_Spread":     "Daily Spread (bps)",
+    "Daily_Depth":      "Daily Depth (£)",
+    "Daily_Volatility": "Daily Volatility (bps)",
+}
+calcs = ["mean", "std", "min", "max"]
+
+
+metrics = {"Spread_bps": "Spread (bps)", "Depth": "Depth (£)",
+           "Ret_bps": "Return (bps)", "Volume": "Volume"}
+
+daily_summary = (
+    daily.groupby("Stock")[list(metrics_daily)]
+    .agg(calcs)
+    .round(2)
+)
+daily_summary = daily_summary.stack(level=0).rename_axis(["Stock", "Metric"])
+daily_summary.columns = [c.capitalize() for c in daily_summary.columns]
+daily_summary = daily_summary.rename(index=metrics_daily, level="Metric")
+summary_table = summary_table.rename(index=metrics, level="Metric")
+
+# Combine with the earlier per-minute summary_table
+combined = pd.concat([summary_table, daily_summary])
+
+metric_order = list(metrics.values()) + list(metrics_daily.values())
+# -> ['Spread (bps)', 'Depth (£)', 'Return (bps)', 'Volume',
+#     'Daily Spread (bps)', 'Daily Depth (£)', 'Daily Volatility (bps)']
+
+combined = combined.reindex(
+    pd.MultiIndex.from_product(
+        [df["Stock"].unique(), metric_order],
+        names=["Stock", "Metric"],
+    )
+)
+
+
+flat = combined.reset_index()
+# blank out repeated Stock labels so it still reads as grouped
+flat["Stock"] = flat["Stock"].mask(flat["Stock"].duplicated(), "")
+flat.to_markdown(index=False)
+print(flat.to_markdown(index=False))
+```
+
+The ranking is consistent on every measure. Astra zeneca.L is the most liquid: its average quoted spread (~2.5 bps) is roughly 5.6x tighter than BRBY.L's (~13.9 bps) and ~2.9x tighter than NXT.L's (~7.2 bps). Its book at the touch is the deepest at ~GBP 21k, about 4.5x deeper than BRBY.L's ~GBP 4.8k, and a trade actually prints in ~98% of all minutes in our sample versus only ~67-68% for the mid- and small-cap. Burberry is the least liquid: a spread several times wider, depth less than a quarter of AZN's, and the highest one-minute return volatility (mean |return| ~7.1 bps vs ~3.5-4.1 for the other two). Next sits in between on every dimension. The cost and the available size move together, so trading size in Burberry is doubly expensive - you pay a wide spread *and* you run out of depth quickly.
+
+```{python}
+#| tbl-cap: Correlation between variables of interest and volatility
+rows = []
+for s in chosen_stocks:
+    sub = daily[daily["Stock"] == s]
+    for label, col in [("Spread vs volatility", "Daily_Spread"),
+                       ("Depth vs volatility",  "Daily_Depth")]:
+        r, p = stats.pearsonr(sub[col], sub["Daily_Volatility"])
+        rows.append({"Stock": s, "Relationship": label,
+                     "Pearson r": round(r, 3), "p-value": round(p, 4)})
+pd.DataFrame(rows)
+```
+
+Spread and volatility are positively correlated for all three stocks, and depth and volatility are negatively correlated. In words, on more volatile days spreads widen and depth thins out at the same time, so liquidity gets worse exactly when prices are moving most.
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.5))
+for ax, s in zip(axes, chosen_stocks):
+    sub = daily[daily["Stock"] == s]
+    x, y = sub["Daily_Volatility"].values, sub["Daily_Spread"].values
+    ax.scatter(x, y, color=COLOURS[s], alpha=0.7, edgecolor="white", linewidth=0.5)
+    b = np.polyfit(x, y, 1)
+    xs = np.linspace(x.min(), x.max(), 100)
+    ax.plot(xs, np.polyval(b, xs), color="black", linestyle="--", linewidth=1.5)
+    r = stats.pearsonr(x, y)[0]
+    ax.set_title(f"{s}   (r = {r:+.2f})")
+    ax.set_xlabel("Daily volatility (mean |1-min ret|, bps)")
+axes[0].set_ylabel("Daily spread (bps)")
+fig.suptitle("Daily spread vs daily volatility", fontweight="bold")
+plt.tight_layout(); plt.show()
+```
+
+### Reading the Scatter Plots
+
+For every stock the points slope upward and the fitted line is positive, so days with higher volatility tend to have wider spreads. The slope is gentlest for AstraZeneca and steepest for Burberry, which means the small-cap's trading cost reacts the most to volatility. We put numbers on these slopes in the regression below.
+
+### Regression Analysis
+
+For each stock we regress daily spread on daily volatility:
+$$\text{Daily Spread}_d = \alpha + \beta \cdot \sigma_d + \varepsilon_d$$
+A positive $\beta$ means higher volatility goes with wider spreads, i.e. lower liquidity. We use HC1 heteroskedasticity-robust standard errors, since the size of the regression errors is likely to vary with volatility.
+
+```{python}
+#| tbl-cap: Regression outputs Spread on Volatility, HC1 robust SE; *** p<.01, ** p<.05, * p<.10
+reg_rows = []
+models = {}
+for s in chosen_stocks:
+    sub = daily[daily["Stock"] == s]
+    X = sm.add_constant(sub["Daily_Volatility"].values)
+    res = sm.OLS(sub["Daily_Spread"].values, X).fit(cov_type="HC1")
+    models[s] = res
+    reg_rows.append({
+        "Stock": s,
+        "alpha": res.params[0], "alpha t": res.tvalues[0],
+        "beta (volatility)": res.params[1], "beta t": res.tvalues[1],
+        "beta p-value": res.pvalues[1],
+        "R-squared": res.rsquared, "N": int(res.nobs),
+    })
+
+# --- Compact regression comparison instead of three full summaries ---
+
+# 1) Side-by-side comparison table: every stock as a column, every stat as a row.
+def _star(p):
+    return "***" if p < 0.01 else "**" if p < 0.05 else "*" if p < 0.10 else ""
+
+rows = {}
+for s in chosen_stocks:
+    res = models[s]
+    a, b = res.params
+    se_a, se_b = res.bse
+    t_a, t_b = res.tvalues
+    p_a, p_b = res.pvalues
+    ci_lo, ci_hi = res.conf_int()[1]
+    rows[s] = {
+        "alpha (bps)":             f"{a:.3f}",
+        "  std err":               f"({se_a:.3f})",
+        "  t-stat":                f"{t_a:.2f}",
+        "beta on volatility":      f"{b:.3f}{_star(p_b)}",
+        "  std err ":              f"({se_b:.3f})",
+        "  t-stat ":               f"{t_b:.2f}",
+        "  95% CI":                f"[{ci_lo:.2f}, {ci_hi:.2f}]",
+        "R-squared":               f"{res.rsquared:.3f}",
+    }
+comp = pd.DataFrame(rows)
+comp.index.name = "Daily_Spread ~ const + Daily_Volatility"
+
+comp
+```
+
+```{python}
+#| fig-cap: Sensitivity plot of the beta coefficients.
+# 2) Coefficient forest plot: shows that BRBY's slope is in a different league.
+fig, ax = plt.subplots(figsize=(10, 3))
+for i, s in enumerate(chosen_stocks):
+    res = models[s]
+    b = res.params[1]
+    lo, hi = res.conf_int()[1]
+    ax.errorbar(b, i, xerr=[[b - lo], [hi - b]],
+                fmt="o", color=COLOURS[s], capsize=6, capthick=1.6,
+                markersize=10, markeredgecolor="black", markeredgewidth=0.6,
+                elinewidth=1.6)
+    ax.text(hi + 0.03, i, f"  {b:.2f}  [{lo:.2f}, {hi:.2f}]",
+            va="center", fontsize=9)
+ax.axvline(0, color="grey", linestyle="--", linewidth=0.8, alpha=0.7)
+ax.set_yticks(range(len(chosen_stocks)))
+ax.set_yticklabels(chosen_stocks)
+ax.set_xlabel(r"$\beta$: extra bps of spread per +1 bp of daily volatility (HC1 95% CI)")
+ax.set_title("Spread-to-volatility sensitivity by stock", fontweight="bold")
+ax.invert_yaxis()
+ax.set_xlim(left=-0.05)
+plt.tight_layout(); plt.show()
+
+```
+
+The regression analysis shows a positive relationship between daily volatility and bid-ask spreads for all three stocks. The associated beta coefficient of daily volatility is positive and statistically significant in all three cases, all having p-values below 0.001. This indicates that higher-volatility days are associated with wider bid-ask spreads and therefore lower liquidity. This result is consistent with legacy market microstructure theory in [@glostenMilgrom1985]. When volatility rises, all liquidity providers in the market face more adverse-selection risk because prices are more uncertain and informed trading is potentially more costly to trade against, similar to a "Market of lemons" scenario where one would need more compensation to offset the low quality of information. As a result, they demand compensation by quoting wider spreads [@brunnermeierPedersen2009]. 
+
+Volatility explains a meaningful share of the day-to-day variation in spreads, with $R^2$ values of roughly 31% to 41% across the three stocks. This strongly suggests that volatility is a key driver of daily liquidity conditions, although it is not the only factor that has been affecting spreads.
+For Astrazeneca, a one basis point increase in daily volatility is associated with an increase in the spread of approximately 0.17 basis points. For Next, the equivalent effect is approximately 0.37 basis points. For Burberry, the effect is much larger, at approximately 0.76 basis points. This means that Burberry’s spread reacts to volatility roughly four to five times as strongly as Astrazeneca’s. Although the correlation between volatility and spreads is slightly higher for Astrazeneca and Next than for Burberry, the regression slope is steepest for Burberry. From a trading-cost perspective, this slope is particularly important because it shows how much the spread widens when volatility increases.
+
+Therefore, orders in less liquid names such as Burberry should be handled more carefully during volatile periods, potentially by using more patient execution strategies or splitting trades over time to reduce spread and price-impact costs.
+
+## Shortcomings & Remedies
+
+A few limitations are worth noting for anyone trading on these results. Firstly, 64 trading days for three stocks covers one particular period is not nearly enough to draw wide conclusions from [@brunnermeierPedersen2009]. Liquidity can change suddenly in stressed markets due to market and funding liquidity being reinforceful. Therefore, a longer sample with more names would test whether the patterns hold across different market conditions. Secondly, daily spread and daily volatility are built from the same mid-quotes and are jointly determined, so the regression shows association rather than the definitive cause, a way of solving this issue would be to be using lagged volatility or an instrument would help separate the two. And finally, the costs are quoted, not realised; the cost actually paid by a marketable order, and the price impact of walking deeper into the book, are not captured here. Trade-level data and a full order book would let us measure effective spreads and price impact directly.
+
+## Conclusion
+
+As the analysis portrays, liquidity and market cap are connectedively decreased, and the large-cap stocks are tighter and deeper. Furthermore, liquidity is viewed as worst at open and improves throughout the day as information is processed into the market, with spreads tightening throughout too due to this. Following this, spreads also rise with daily volatility for all of the stocks, with the least liquid stock seeing the strongest effect. All in all, this means that timing execution as well as sizing orders to available depth are important factors for a trader or investor to consider
+
+## References {.unnumbered}
+
+::: {#refs}
+:::
+

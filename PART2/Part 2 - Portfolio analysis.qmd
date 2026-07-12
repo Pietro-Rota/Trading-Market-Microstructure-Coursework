@@ -1,0 +1,466 @@
+---
+title: "SMM921 Coursework: Trading and Market Microstructure"
+author: "Group 19"
+date: "today"
+format:
+  pdf:
+    keep-ipynb: true
+    documentclass:  article
+    papersize: a4
+    geometry: margin=0.9in
+    fontsize: 12pt
+    linestretch: 1.25
+    number-sections: true
+    colorlinks: false
+    fig-pos: 'H'
+    fig-align: center
+    tbl-cap-location: top
+    fig-format: png
+    fig-dpi: 500
+    embed-resources: true
+bibliography: references.bib
+csl: harvard-cite-them-right.csl
+link-citations: true
+project:
+  type: default
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+jupyter: python3
+---
+
+# Portfolio analysis
+
+```{python}
+#| label: setup
+import os, sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import Markdown
+
+# Anchor the kernel on the folder holding smm921_analysis.py + the .xlsx data, so
+# this works whether the kernel starts in PART2 (quarto render) or at the repo root
+# (VS Code "Run Cell" opens the kernel at the workspace root).
+if not os.path.exists("smm921_analysis.py"):
+    _part2 = os.path.join(os.getcwd(), "PART2")
+    if os.path.exists(os.path.join(_part2, "smm921_analysis.py")):
+        os.chdir(_part2)
+sys.path.insert(0, os.getcwd())
+
+# import smm921_analysis as an   # reuses (does not modify) the supplied files
+
+plt.rcParams.update({"figure.dpi": 600, "axes.grid": True,
+                     "grid.alpha": .25, "font.size": 9})
+
+ANN = 12                      # monthly -> annual scaling for means
+ANN_SQRT = np.sqrt(12)       # for std / Sharpe
+IC = 0.02                    # information coefficient (given)
+LAMBDA = 4.0                 # risk-aversion coefficient (given)
+WINDOW = 60                  # rolling window for cov / vol (given)
+RF = 0.0                     # no risk-free rate supplied -> excess = total return
+```
+
+```{python}
+prices = pd.read_excel("SMM921_PF_DATA_2026.xlsx", sheet_name="Sheet1")
+prices["Date"] = pd.to_datetime(prices["Date"])
+prices = prices.set_index("Date").sort_index()
+
+rets = prices.pct_change().dropna(how="all")
+world = rets.mean(axis=1)
+
+def momentum_signal(rets):
+    """12-1 momentum: cumulative return over the 11 months [t-12 .. t-2],
+    i.e. a 12-month window excluding the most recent month. The value on
+    row t is the signal used to *hold* over month t (uses only past data)."""
+    log1p = np.log1p(rets)
+    # sum of log returns over months t-12..t-2  == rolling 11-sum shifted by 2
+    cum = log1p.rolling(11).sum().shift(2)
+    return np.expm1(cum)
+
+sig = momentum_signal(rets)
+
+"""Equal-weighted quintile portfolios, rebalanced monthly, + HML (Q5-Q1)."""
+cols = [f"Q{i}" for i in range(1, 5 + 1)]
+mom = pd.DataFrame(index=rets.index, columns=cols, dtype=float)
+membership = {}                          # for sliding scale
+membership_mode = {}                          # for sliding scale
+
+for t in rets.index:
+    s = sig.loc[t].dropna()
+    if s.size < 5:
+        continue
+    try:
+        ranks = pd.qcut(s.rank(method="first"), 5, labels=False)
+    except ValueError:
+        continue
+    r_t = rets.loc[t]
+    for q in range(5):
+        members = ranks.index[ranks == q]
+        mom.loc[t, f"Q{q + 1}"] = r_t[members].mean()
+    membership[t] = s.rank(pct=True)    # save this month's momentum percentile (0..1)
+    membership_mode[t] = ranks + 1            # save this month's memberships (1..5)
+
+mom = mom.dropna(how="all")
+mom["HML"] = mom[f"Q{5}"] - mom["Q1"]
+quintiles = pd.DataFrame(membership_mode).T.sort_index()        # dates x countries
+modal_q = quintiles.mode(axis=0).iloc[0].reindex(rets.columns)
+
+# Per-country momentum score: the average cross-sectional percentile rank of the
+# signal over the whole sample (0 = perennial loser, 1 = perennial winner). This
+# is the continuous, unbucketed analogue of the quintile sort, used to colour the
+# country scatter in @fig-perf.
+ranks_ts = pd.DataFrame(membership).T.sort_index()         # dates x countries
+mom_score = ranks_ts.mean().reindex(rets.columns)
+
+
+def crra_weights(alpha, sigma, lam=LAMBDA):
+    """Constrained MV-CRRA optimal weights (sum to 1). Mirrors smm921_pfOpt.py."""
+    alpha = np.asarray(alpha, float)
+    sigma = np.asarray(sigma, float)
+    n = alpha.size
+    inv = np.linalg.inv(sigma)
+    ones = np.ones(n)
+    gamma = (alpha @ inv @ ones - lam) / (ones @ inv @ ones)
+    w = inv @ (alpha - ones * gamma) / lam
+    return w
+
+def constant_corr_cov(sigma):
+    """Keep variances, replace every off-diagonal correlation with the mean
+    off-diagonal correlation (Elton-Gruber constant-correlation model)."""
+    sd = np.sqrt(np.diag(sigma))
+    corr = sigma / np.outer(sd, sd)
+    n = corr.shape[0]
+    off = corr[~np.eye(n, dtype=bool)]
+    rbar = off.mean()
+    cc = np.full_like(corr, rbar)
+    np.fill_diagonal(cc, 1.0)
+    return (cc * np.outer(sd, sd)), rbar
+
+def run_optimisation(rets, signal, robust=False, window=WINDOW, ic=IC, lam=LAMBDA):
+    """Walk-forward MV optimisation.
+
+    At decision time = end of month t (need >= `window` past returns), use the
+    most recent `window` returns to estimate Sigma and per-country vols. Build
+    alphas from the cross-sectionally standardised momentum signal known at t.
+    Hold the resulting weights over month t+1 and record that return.
+
+    First weights use returns 1..60 -> first portfolio return is month 61.
+    """
+    idx = rets.index
+    port_ret, weights, gross, turnover = {}, {}, {}, {}
+    prev_w = None
+    for i in range(window - 1, len(idx) - 1):
+        t = idx[i]            # decision date
+        t1 = idx[i + 1]       # holding month
+        win = rets.iloc[i - window + 1: i + 1]      # 60 returns ending at t
+        sigma = win.cov().values
+        vols = win.std().values
+        sigma_resid = vols.mean()                    # scalar (per task wording)
+
+        s = signal.loc[t1]
+        if s.isna().any():
+            continue
+        z = (s - s.mean()) / s.std()                 # cross-sectional z-score
+        alpha = ic * sigma_resid * z.values
+
+        if robust:
+            sigma, _ = constant_corr_cov(sigma)
+
+        w = crra_weights(alpha, sigma, lam)
+        port_ret[t1] = float(rets.loc[t1].values @ w)
+        weights[t1] = pd.Series(w, index=rets.columns)
+        gross[t1] = np.abs(w).sum()
+        turnover[t1] = np.nan if prev_w is None else np.abs(w - prev_w).sum()
+        prev_w = w
+
+    pr = pd.Series(port_ret).sort_index()
+    pr.name = "OPT_ROBUST" if robust else "OPT_SAMPLE"
+    W = pd.DataFrame(weights).T.sort_index()
+    diag = pd.DataFrame({"gross": pd.Series(gross),
+                         "turnover": pd.Series(turnover)}).sort_index()
+    return pr, W, diag
+
+pr_s, W_s, d_s = run_optimisation(rets, sig, robust=False)
+pr_r, W_r, d_r = run_optimisation(rets, sig, robust=True)
+opt = pd.concat([pr_s, pr_r], axis=1)
+
+```
+
+
+## Executive summary {#sec-summary}
+
+This portfolio analysis evaluates data of 34 countries’ equity index levels. Our analysis benchmarks the countries on a risk adjusted return and on systematic risk; we also test the classic momentum signal through the portfolio, defining this as total return over 12 months leading up to the current observation; This is followed by the creation of HML and, lastly, have built a mean variance optimisation momentum strategy [@markowitz1952] , improved via a constant correlation covariance [@eltonGruber1973].
+
+
+```{python}
+#| label: fig-rets
+#| fig-cap: "All returns index levels -- the world is the cross-sectional mean"
+plt.figure(figsize=(9, 3.6))
+for c in rets.columns:
+    plt.plot(rets.index, (1+rets[c]).cumprod(), label=c, lw=0.8)
+plt.plot(world.index, (1+world).cumprod(), label="World", linestyle="--", color="red", lw=1.5)
+plt.title("Cumulative wealth by country ")
+plt.legend(fontsize=6, ncol=3); plt.tight_layout(); plt.show(); plt.close()
+```
+
+## Data and conventions {#sec-data}
+
+The 241 monthly index levels yield 240 monthly total returns per country. The "world / market portfolio" is the equal-weighted cross-sectional average return across the 34 countries each month. No risk-free rate is supplied and the levels are total returns, so we set $r_f=0$; Sharpe ratios are therefore annualised mean over annualised volatility \[@sharpe1966]. Means are annualised by $\times 12$, volatilities by $\times \sqrt{12}$. Systematic risk is the CAPM beta to the world return, $\beta_i=\operatorname{cov}(r_i, r_{\text{world}})/\operatorname{var}(r_{\text{world}})$ \[@sharpe1964].
+
+
+## Country performance and systematic risk {#sec-perf}
+
+```{python}
+#| label: tbl-perf
+#| tbl-cap: "Best and worst five countries by annualised Sharpe ratio."
+mu_m = rets.mean()
+sd_m = rets.std()
+perf = pd.DataFrame({
+    "AnnMean": mu_m * ANN,
+    "AnnStd": sd_m * ANN_SQRT,
+    "Sharpe": ((mu_m - RF) / sd_m) * ANN_SQRT,
+})
+var_w = world.var()
+perf["Beta"] = pd.Series({c: rets[c].cov(world) / var_w for c in rets.columns})
+perf = perf.sort_values("Sharpe", ascending=False)
+
+dots = pd.DataFrame([['...'] * len(perf.columns)], 
+                    columns=perf.columns, 
+                    index=['...'])
+
+tab = pd.concat([perf.head(5).round(3), dots, perf.tail(5).round(3)])
+tab = tab.rename(columns={"AnnMean":"Ann. mean","AnnStd":"Ann. vol","Sharpe":"Sharpe","Beta":"Beta"})
+tab
+```
+
+```{python}
+#| label: fig-perf
+#| fig-cap: "Left: annualised Sharpe by country, colored by modal momentum quintile.\nRight: annualised mean return versus systematic risk (beta to the world). colored by average momentum percentile."
+ 
+#| fig-width: 9
+#| fig-height: 3.6
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
+# colour each country by its modal momentum quintile (Q1 losers -> Q5 winners)
+q_colors = plt.cm.RdYlGn(np.linspace(0.15, 0.85, 5))
+pt_colors = [q_colors[int(modal_q[c]) - 1] if pd.notna(modal_q[c]) else "0.6" for c in perf.index]
+ax[0].bar(perf.index, perf["Sharpe"], color=pt_colors)
+ax[0].set_title("Annualised Sharpe by country"); ax[0].axhline(0, color="k", lw=.6)
+ax[0].tick_params(axis="x", rotation=90, labelsize=5)
+
+# colour each country on a sliding scale by its average momentum percentile
+# (red = perennial loser -> green = perennial winner). RdYlGn is diverging, so
+# anchor neutral at 0.5 (median) and stretch bounds symmetrically for contrast.
+half = (mom_score - 0.5).abs().max()
+sc = ax[1].scatter(perf["Beta"], perf["AnnMean"], s=18,
+                   c=mom_score.reindex(perf.index).values,
+                   cmap="RdYlGn", vmin=0.5 - half, vmax=0.5 + half)
+for c in perf.index:
+    ax[1].annotate(c, (perf.loc[c,"Beta"], perf.loc[c,"AnnMean"]), fontsize=4.5,
+                   xytext=(2,2), textcoords="offset points")
+ax[1].set_xlabel("Beta vs world"); ax[1].set_ylabel("Annualised mean")
+ax[1].set_title("Return vs systematic risk")
+cbar = fig.colorbar(sc, ax=ax[1], fraction=0.046, pad=0.04)
+cbar.set_label("Avg momentum rank", fontsize=8)
+cbar.ax.tick_params(labelsize=5)
+plt.tight_layout(); plt.show()
+```
+
+Table 1 and Figure 2 demonstrate how the United States is a strong risk adjusted performer in the sample. It generated a top decile annualized mean of approximately $12.5%$, matched with a low annualized volatility of approximately $17.6%$ and high Sharpe ratio of approximately $0.71$. Whilst its beta of $0.71$ indicates less sensitivity to movements in equal weighted world benchmark, it is not the lowest beta of any developed market; Japan has a lower beta of approximately $0.67$. that being said, it is still the strongest risk adjusted performer.
+
+Taiwan and Korean produced the high returns whilst also having high betas, signalling leveraged plays through greater volatility and a reduced Sharpe ratio.
+
+As expected, the euro periphery (inclusive of countries such as Portugal and Ireland) demonstrated weaker risk adjusted returns; these countries portray low returns alongside high betas and deep drawdowns. Due to this difference, we conduct a useful consistency check, understanding that the average beta is approximately $1$, thus exactly where it must be when the benchmark is equal to the cross-sectional mean. The spread itself simply highlights the systematic risk of each country to broad global market movements. However, it is important to note that the benchmark itself must not be interpreted as a market capitalisation weighted index.
+
+
+## Momentum signal and sorted portfolios {#sec-mom}
+
+As established by Jegadeesh and Titman, (1993)[@jegadeesh1993] we define the $12-1$ momentum signal as a country’s compounded total return over twelve months, excluding the most recent month (from $t-12$ to $t-2$). We exclude the most recent month due to how recent returns may be biased via short term reversal effects, thus affecting the trend signal [@asness2013].
+
+
+```{python}
+#| label: tbl-mom
+#| tbl-cap: "Performance of the five momentum-sorted portfolios and the HML (Q5-Q1) spread."
+def summary_stats(obj):
+    df = obj.to_frame() if isinstance(obj, pd.Series) else obj
+    mu, sd = df.mean(), df.std()
+    out = pd.DataFrame({
+        "AnnMean%" : mu * ANN * 100,
+        "AnnStd%"  : sd * ANN_SQRT * 100,
+        "Sharpe"   : (mu / sd) * ANN_SQRT,
+        "Skew"     : df.skew(),
+        "ExKurt"   : df.kurt(),
+        "MinMo%"   : df.min() * 100,
+        "MaxMo%"   : df.max() * 100,
+    })
+    # max drawdown on cumulative wealth
+    mdd = {}
+    for c in df.columns:
+        w = (1 + df[c].fillna(0)).cumprod()
+        mdd[c] = (w / w.cummax() - 1).min() * 100
+    out["MaxDD%"] = pd.Series(mdd)
+    return out
+mom_join = mom.join(pd.Series(world, name="World"), how="inner")
+mom_stats = summary_stats(mom_join)
+mom_stats.round(2)
+```
+
+```{python}
+#| label: fig-mom
+#| fig-cap: "Left: cumulative wealth of the quintiles and HML. Right: annualised mean return by portfolio. The sort works in sign but is non-monotonic, and HML is weak."
+#| fig-width: 9
+#| fig-height: 3.6
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
+cum = (1 + mom_join.fillna(0)).cumprod()
+for c in mom_join.columns:
+    ax[0].plot(cum.index, cum[c], label=c, lw=1.1)
+ax[0].set_title("Cumulative wealth")
+ax[0].legend(fontsize=6, ncol=3)
+ax[1].bar(mom_stats.index, mom_stats["AnnMean%"], color="#3b6ea5")
+ax[1].axhline(0, color="k", lw=.6); ax[1].set_title("Annualised mean return (%)")
+plt.tight_layout(); plt.show(); plt.close()
+```
+
+As figure 3 portrays, momentum is generally weak and non-monotonic. This is because, whilst Q5, or the winners, do beat the losers in earnings (9% as compared to 7.4% respectively), Q3 is as strong as Q5, and Q2 generates the lowest annualized mean return. Therefore, the portfolios do not form a clear return ladder sequence. Also, the HML portfolio earned approximately only 1.5% per year, resulting in a low Sharpe ratio of 0.11. Furthermore, its maximum drawdown and negative skewness indicate a momentum crash, which emphasises exposure to sharp reversals such as the 2009 crisis, where ‘sharp reversals hit the short-losers leg hardest’ [@daniel2016]. This demonstrates the correct theory, where momentum signal has the correct average direction, but with only 34 bets and indices that are already diversified baskets, country momentum is weaker than single stock momentum, as connoted by Asness, Moskowitz and Pedersen, (2013) [@asness2013]. Nevertheless, the correct average direction can be enough for an optimisation such as mean variance can exploit.
+
+## Mean-variance optimisation on momentum alphas {#sec-opt}
+For optimisation, we run a walk-forward back test from month 61. We convert the signal each month into an alpha; Grinold et al., (1989)[@grinold1989; @grinold2000] establish the law of active management, connoting this formula:
+$$
+\max_w\; w'\hat\alpha-\tfrac{\lambda}{2}w'\Sigma_t w \quad\text{s.t.}\quad \mathbf{1}'w=1,\qquad \lambda=4
+$$
+
+$z_i$ is the standardized momentum, where mean is equal to 0 and standard deviation is equal to 1. Furthermore, as established, our information coefficient is equal to 0.02 and the σ residual is a scalar equal to the mean of the 34 countries’ volatilities over the analysed months.
+ 
+The goal is to produce a scale free and cross sectionally centered alpha, by standardizing the raw signal to a z-score, before being scaled by the magnitude of returns and information coefficients.
+
+with closed form $w=\tfrac{1}{\lambda}\Sigma_t^{-1}(\hat\alpha-\gamma\mathbf{1})$ and $\gamma=\frac{(\hat\alpha'\Sigma_t^{-1}\mathbf{1}-\lambda)}{(\mathbf{1}'\Sigma_t^{-1}\mathbf{1})}$. We then earn the realised return over the following month and roll forward.
+
+
+```{python}
+#| label: fig-opt
+#| fig-cap: "Sample-covariance optimisation. Left: cumulative wealth. Right: gross leverage (sum of absolute weights); the dashed line marks fully-invested (1x). Leverage averages ~20x -- the hallmark of an ill-conditioned covariance inverse."
+#| fig-width: 9
+#| fig-height: 3.6
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
+ax[0].plot((1+pr_s.fillna(0)).cumprod(), color="#b5651d", lw=1.1)
+ax[0].set_title("Optimised wealth -- sample cov")
+ax[1].plot(d_s.index, d_s["gross"], color="#b5651d", lw=1.0)
+ax[1].axhline(1, color="r", lw=.7, ls="--"); ax[1].set_title("Gross leverage (sum |w|)")
+plt.tight_layout(); plt.show(); plt.close()
+```
+
+The mean variance optimizer underperforms to quite the extent; with a Sharpe ratio of approximately 0.24, an annualized mean return of 12% and annualized volatility of 48%, once correcting the alignment between the momentum signal and the returns.
+
+The average gross leverage being times the capital, this is demonstrative of error maximisation of mean variance optimisation, where large offsetting long and short positions and consequently badly estimated values result in unstable portfolio weights within the covariance matrix. Indicatively, the issue here is the risk model, not the alpha.
+
+## A robust covariance: the constant-correlation model {#sec-robust}
+
+The Elton-Gruber constant correlation model [@eltonGruber1973; @eltonGruber2014]  is implemented as 561 pairwise correlations cannot be estimated form 60 months. This constant correlation model keeps sample variances on the diagonal and introduces a single average off diagonal correlational. Consequently, heavy shrinkage discards noise, and optimisation is otherwise equal.
+
+
+```{python}
+#| label: tbl-opt2
+#| tbl-cap: "Optimised momentum portfolio: sample covariance versus constant-correlation covariance. Identical alphas and risk aversion -- only the covariance estimator differs."
+opt_stats = summary_stats(opt)
+
+sub = opt_stats.loc[:, ["AnnMean%","AnnStd%","Sharpe","MaxDD%"]].copy()
+sub["AvgGross"] = [d_s["gross"].mean(), d_r["gross"].mean()]
+sub["AvgTurnover"] = [d_s["turnover"].mean(), d_r["turnover"].mean()]
+sub.index = ["Sample cov", "Constant-corr"]
+sub.round(2)
+
+```
+
+```{python}
+#| label: fig-robust
+#| fig-cap: "Sample versus robust covariance. Left: cumulative wealth -- the robust line compounds steadily where the sample line lurches. Right: gross leverage falls from ~20x to ~7x."
+#| fig-width: 9
+#| fig-height: 3.6
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
+cw = (1+opt.fillna(0)).cumprod()
+ax[0].plot(cw.index, cw["OPT_SAMPLE"], label="Sample cov", color="#b5651d", lw=1.1)
+ax[0].plot(cw.index, cw["OPT_ROBUST"], label="Constant-corr", color="#2e7d32", lw=1.1)
+ax[0].legend(fontsize=7); ax[0].set_title("Cumulative wealth")
+ax[1].plot(d_s.index, d_s["gross"], label="Sample", color="#b5651d", alpha=.85, lw=1.0)
+ax[1].plot(d_r.index, d_r["gross"], label="Constant-corr", color="#2e7d32", alpha=.85, lw=1.0)
+ax[1].legend(fontsize=7); ax[1].set_title("Gross leverage (sum |w|)")
+plt.tight_layout(); plt.show(); plt.close()
+```
+
+## Inference and recommendation {#sec-rec}
+
+As mentioned, the information coefficient and risk aversion remain unchanged. The difference, instead, arises from the covariance matrix, where replacing multiple correlations with a single average correlation imposes structure on the risk model, thus reducing the optimiser’s sensitivity to noisy correlation estimates.
+
+These results therefore support the usage of the constant correlation covariance matrix rather than the unrestricted sample. Nevertheless, this should not be deemed as ready to invest due to average gross leverage still being $7.2$, and the strategy still experiences a maximum drawdown of over $20%$ lower .
+
+As for recommendation, the adoption of the constant correlation covariance matrix for the momentum optimisation is specified. Then, it is recommended to benchmark against shrinkage [@ledoit2004] as well as a single factor world market model. Furthermore, we recommend imposing leverage and turnover limits and incorporate transaction costs directly into the optimisation in order to have a more explicit model. This is also achieved through validation of the information coefficient out of sample.
+
+
+```{python}
+#| label: rolling_sharpe_fig
+#| fig-cap: "Left: rolling annualised Sharpe ratio. Right: drawdown of both portfolios."
+fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+
+WIN = 36  # rolling window in months (3 years)
+ann = np.sqrt(12)
+
+# --- Left: rolling annualised Sharpe ---
+for col, lab, color in [("OPT_SAMPLE", "Sample cov", "#b5651d"),
+                         ("OPT_ROBUST", "Robust (const-corr)", "#2e7d32")]:
+    r = opt[col].dropna()
+    roll_sharpe = (r.rolling(WIN).mean() / r.rolling(WIN).std()) * ann
+    ax[0].plot(roll_sharpe.index, roll_sharpe, label=lab, color=color, lw=1.1)
+ax[0].axhline(0, color="k", lw=.6)
+ax[0].set_title(f"Rolling {WIN}-month annualised Sharpe")
+ax[0].set_ylabel("Sharpe"); ax[0].legend(fontsize=8)
+
+# --- Right: drawdown (underwater) ---
+for col, lab, color in [("OPT_SAMPLE", "Sample cov", "#b5651d"),
+                         ("OPT_ROBUST", "Robust (const-corr)", "#2e7d32")]:
+    cw = (1 + opt[col].fillna(0)).cumprod()
+    dd = cw / cw.cummax() - 1
+    ax[1].plot(dd.index, dd * 100, label=lab, color=color, lw=1.1)
+    ax[1].fill_between(dd.index, dd * 100, 0, color=color, alpha=.15)
+ax[1].set_title("Drawdown")
+ax[1].set_ylabel("Drawdown (%)"); ax[1].legend(fontsize=8)
+ax[1].legend(fontsize=8, loc="upper right")
+
+plt.tight_layout(); plt.show()
+```
+
+Both portfolios swing through similar Sharpe regimes, but the robust line spends more time positive and recovers faster post-2024, while the sample line dips below zero repeatedly. The drawdown panel is decisive: sample-cov sits in drawdowns of 60-80%+ for most of the sample, whereas robust rarely breaches ~40% and recovers to new highs far more often, the same return path delivered with materially less losses.
+
+```{python}
+#| label: rolling_weights_fig
+#| fig-cap: "Cross-sectional weight distribution over time. Left: sample covariance. Right: robust constant-correlation covariance. The robust weights are more stable and less extrem e."
+fig, ax = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+
+qs = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0]
+labels = ["min", "p10", "p25", "median", "p75", "p90", "max"]
+
+for a, (W, title, color) in zip(ax, [(W_s, "Sample cov", "#b5651d"),
+                                     (W_r, "Robust (const-corr)", "#2e7d32")]):
+    # W: rows = months, cols = 34 countries. Quantiles across countries each month.
+    q = W.quantile(qs, axis=1).T          # index = dates, cols = quantiles
+    # shaded bands between symmetric quantile pairs
+    a.fill_between(q.index, q[0.0],  q[1.0],  color=color, alpha=.12, label="min–max")
+    a.fill_between(q.index, q[0.10], q[0.90], color=color, alpha=.20, label="p10–p90")
+    a.fill_between(q.index, q[0.25], q[0.75], color=color, alpha=.35, label="p25–p75")
+    a.plot(q.index, q[0.50], color="k", lw=1.0, label="median")
+    a.axhline(0, color="k", lw=.5, ls=":")
+    a.set_title(f"Cross-sectional weight distribution, {title}")
+    a.set_ylabel("Portfolio weight (per country)")
+    a.legend(fontsize=7, loc="upper left")
+
+plt.tight_layout(); plt.show()
+```
+
+The sample-cov weights fan out to ±3-5x per country with the bands cancelling around a ~0 median, the offsetting long/short positions that drive the $\sim 19 \text{x}$ gross leverage. The robust estimator collapses that envelope to roughly $\pm 0.5\text{x}$, holding the same near-zero median with a fraction of the gross exposure, which is exactly why its leverage and turnover fall.
+
+
+## References {.unnumbered}
+
+::: {#refs}
+:::

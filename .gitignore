@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.csl
+*.bib
+.gitattributes
+.jupyter_cache
+
+
+
+# Virtual environments
+.venv
+.claude
+.latexmk
+.vscode
+.unused
+
+# extra files
+Submission_form.pdf
+Add_Submission_form.py
+notify.py
+smm921_analysis.py
+shared.qmd

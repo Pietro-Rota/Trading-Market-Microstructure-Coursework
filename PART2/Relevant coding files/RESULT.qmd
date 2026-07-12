@@ -1,0 +1,326 @@
+---
+title: 'SMM921 - Part 2: Cross-Country Equity Portfolio Analysis'
+author:
+  - name: Pietro Rota
+    affiliation:
+      - name: Bayes Business School – City, St George’s University of London
+        city: London
+        state: UK
+        url: https://www.bayes.citystgeorges.ac.uk/
+jupyter: python3
+format:
+  html:
+    toc: true
+    code-tools: true
+    code-fold: true
+    code-summary: Show code
+    fig.path: figures/
+    self-contained: true
+    df-print: kable
+    code-block-border-left: royalblue
+    code-block-bg: true
+    font-family: system-ui
+    html-table-processing: none
+    html-math-method: katex
+    fig-pos: 'H'
+    fig-align: center
+    tbl-cap-location: top
+    keep-md: true
+    fig-format: png
+    fig-dpi: 400
+execute:
+  echo: true
+  output: true
+  warning: false
+  message: false
+---
+
+**Perspective:** quantitative portfolio manager. **Data:** `SMM921_PF_DATA_2026.xlsx`,
+20 years of monthly dividend-adjusted index levels for 34 countries (2006-05 to 2026-05).
+
+This notebook reuses, without modifying, the supplied files:
+* `smm921_pfOpt.py` - the CRRA mean-variance weight formula (replicated in `smm921_analysis.crra_weights`).
+* `smm921_analysis.py` - our analysis module (imported below).
+
+**Methodology (from the lecture notes provided):**
+* Alphas: $\hat\alpha_i = \mathrm{IC}\cdot\sigma_{resid}\cdot z(\text{signal}_i)$  (L5, p.12/16/32).
+* Weights: $\max_w w'\mu-\tfrac{\lambda}{2}w'\Sigma w \;\text{s.t.}\; 1'w=1$  (L4, p.5), solved analytically as in `smm921_pfOpt.py`.
+
+**Key assumptions:** risk-free rate = 0 (none supplied; levels are total returns), so Sharpe = mean/std annualised; the "world / market portfolio" is the equal-weighted cross-sectional mean return; momentum is 12-1 (12-month window excluding the most recent month).
+
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:37.122964Z', iopub.status.busy: '2026-06-05T11:29:37.122625Z', iopub.status.idle: '2026-06-05T11:29:38.747343Z', shell.execute_reply: '2026-06-05T11:29:38.745052Z'}
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import smm921_analysis as an   # our reusable module (imports, does not modify, the originals)
+
+prices = an.load_prices()
+rets, world = an.build_returns(prices)
+print('Price rows:', prices.shape[0], '| Monthly returns:', rets.shape,
+      '| Date range:', rets.index.min().date(), '->', rets.index.max().date())
+rets.head()
+```
+
+## 1. Performance comparison & systematic risk
+Annualised mean (`AnnMean`), volatility (`AnnStd`), Sharpe ratio, and CAPM beta
+against the world return $\;\beta_i=\mathrm{cov}(r_i,r_{world})/\mathrm{var}(r_{world})$.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:38.751591Z', iopub.status.busy: '2026-06-05T11:29:38.751106Z', iopub.status.idle: '2026-06-05T11:29:38.785009Z', shell.execute_reply: '2026-06-05T11:29:38.783609Z'}
+perf = an.performance_table(rets, world)
+perf.round(3)
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:38.789583Z', iopub.status.busy: '2026-06-05T11:29:38.789022Z', iopub.status.idle: '2026-06-05T11:29:39.492435Z', shell.execute_reply: '2026-06-05T11:29:39.491082Z'}
+fig, ax = plt.subplots(1, 2, figsize=(13,5))
+ax[0].bar(perf.index, perf['Sharpe']); ax[0].set_title('Annualised Sharpe by country')
+ax[0].tick_params(axis='x', rotation=90); ax[0].axhline(0, color='k', lw=.6)
+ax[1].scatter(perf['Beta'], perf['AnnMean'])
+for c in perf.index:
+    ax[1].annotate(c, (perf.loc[c,'Beta'], perf.loc[c,'AnnMean']), fontsize=6)
+ax[1].set_xlabel('Beta vs world'); ax[1].set_ylabel('Annualised mean')
+ax[1].set_title('Mean return vs systematic risk'); plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:39.496677Z', iopub.status.busy: '2026-06-05T11:29:39.496168Z', iopub.status.idle: '2026-06-05T11:29:39.508546Z', shell.execute_reply: '2026-06-05T11:29:39.507182Z'}
+print('Top 5 by Sharpe:\n', perf.head(5)[['AnnMean','AnnStd','Sharpe','Beta']].round(3))
+print('\nBottom 5 by Sharpe:\n', perf.tail(5)[['AnnMean','AnnStd','Sharpe','Beta']].round(3))
+print('\nAvg beta (should be ~1 as world is the cross-sectional mean): %.3f' % perf['Beta'].mean())
+```
+
+**Reading.** The **USA** is the standout: a top decile annualised mean (~12.5%) achieved with
+*below-average* volatility and the **lowest beta of any developed market (~0.72)** - it delivered
+return without carrying full market risk, hence the best Sharpe (~0.71). **Switzerland** and **Japan**
+similarly show low betas (defensive markets). **Taiwan/Korea** combine high mean returns with high beta
+- they are leveraged plays on the global cycle. At the bottom, **Portugal, Ireland, Belgium, Italy**
+(euro-periphery) pair mediocre returns with high beta and deep drawdowns - poor risk-adjusted payoff.
+Beta is, as expected, centred on 1 because the world series is itself the average of the 34 countries;
+the cross-sectional dispersion of beta (~0.6 to ~1.4) is the systematic-risk story a global manager trades around.
+
+## 2. Momentum signal & sorted portfolios
+
+### 2.1 What the signal is and why
+**Momentum** is the empirical tendency of recent winners to keep outperforming recent losers over
+the next month. We measure it as **12-1 momentum**: the cumulative total return of a country over the
+**12 months up to the current date, but skipping the single most recent month**. Formally, the signal
+that decides how we hold over month $t$ is built only from past data:
+$$\text{mom}_{i,t}=\prod_{k=2}^{12}\bigl(1+r_{i,\,t-k}\bigr)-1
+\qquad\text{(the 11 returns from } t\!-\!12 \text{ to } t\!-\!2\text{)}.$$
+
+* **Why a 12-month window?** It captures the medium-term trend that the momentum literature
+  (Jegadeesh-Titman) documents.
+* **Why drop the most recent month ($t\!-\!1$)?** The newest month is dominated by **short-term
+  reversal / microstructure bounce** (bid-ask, illiquidity). Including it *contaminates* a trend signal
+  with mean-reversion noise, so the standard construction excludes it - hence "12-**1**".
+* **No look-ahead.** In code this is `np.log1p(rets).rolling(11).sum().shift(2)`: sum 11 monthly
+  log-returns, then `shift(2)` so the value on row $t$ ends at $t\!-\!2$. The signal on row $t$ uses
+  *only* information available before month $t$ begins, then we earn month $t$. (Log returns are used
+  purely so the 11-month compounding is an exact rolling sum; the result is converted back with
+  `expm1`.)
+
+### 2.2 How the portfolios are built
+Each month we **rank all available countries by their momentum signal** and cut them into **5
+equal-count quintiles**: Q1 = the ~7 worst (losers) ... Q5 = the ~7 best (winners). Within each
+quintile assets are **equally weighted**, and the sort is **redone every month** (monthly rebalancing).
+The **HML** ("High-minus-Low") portfolio is the pure momentum bet: **long Q5, short Q1** ($Q5-Q1$),
+which strips out the common market move and isolates the winners-minus-losers spread.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:39.511989Z', iopub.status.busy: '2026-06-05T11:29:39.511517Z', iopub.status.idle: '2026-06-05T11:29:40.427060Z', shell.execute_reply: '2026-06-05T11:29:40.425445Z'}
+sig = an.momentum_signal(rets)
+mom = an.momentum_portfolios(rets, sig)
+mom_stats = an.summary_stats(mom)
+mom_stats.round(3)
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:40.431128Z', iopub.status.busy: '2026-06-05T11:29:40.430575Z', iopub.status.idle: '2026-06-05T11:29:40.985774Z', shell.execute_reply: '2026-06-05T11:29:40.984226Z'}
+fig, ax = plt.subplots(1, 2, figsize=(13,5))
+cum = (1+mom.fillna(0)).cumprod()
+for c in mom.columns:
+    ax[0].plot(cum.index, cum[c], label=c)
+ax[0].set_yscale('log'); ax[0].set_title('Cumulative wealth (log scale)'); ax[0].legend(fontsize=8)
+ax[1].bar(mom_stats.index, mom_stats['AnnMean%']); ax[1].set_title('Annualised mean return (%)')
+ax[1].axhline(0, color='k', lw=.6); plt.tight_layout(); plt.show()
+```
+
+### 2.3 Reading the results
+The table reports, for each quintile and for HML, the annualised mean, volatility, Sharpe, skew,
+kurtosis, worst/best month and max drawdown.
+
+* **The sort works in sign but is weak and non-monotonic.** Winners (Q5 ~9.0% p.a.) do beat losers
+  (Q1 ~7.4% p.a.), but the ladder is not clean - Q3 (~9.0%) is as good as Q5, and Q2 is actually the
+  weakest. The signal points the right way on average without cleanly ordering every bucket.
+* **HML is unimpressive on its own:** roughly **+1.5% p.a. with a Sharpe of only ~0.11**, a **-40%
+  drawdown** and **negative skew**. That negative skew is the fingerprint of a **momentum crash** -
+  during sharp reversals (e.g. the 2009 rebound) the shorted prior-losers rally hardest and the
+  long-short book takes a large, sudden loss.
+* **Why so weak here?** This is *country-index* momentum, not single-stock momentum. Two structural
+  reasons: (i) **low breadth** - only 34 bets, so the law of large numbers barely helps; and (ii) each
+  country index is *already a diversified basket*, which damps the idiosyncratic dispersion that
+  single-stock momentum feeds on. The literature consistently finds country momentum far weaker than
+  stock momentum, so this result is exactly what theory predicts - a good sign the implementation is right.
+
+**Verdict.** As a *stand-alone* trade the signal is not compelling. But it carries the **correct sign**,
+and that is enough for Parts 3-4: a mean-variance optimiser can extract value from a weak-but-real alpha
+*provided* the risk side (the covariance matrix) is estimated robustly. That interplay is the real
+lesson of this coursework.
+
+## 3. Mean-variance optimisation on momentum alphas
+
+This is a genuine **walk-forward backtest**: at every month we re-estimate everything from the *past*,
+choose weights, then earn the *next* month's return. Nothing uses future data.
+
+### 3.1 From a raw signal to an *alpha* (the Grinold-Kahn step)
+A momentum number is not a return forecast - it has arbitrary units. We turn it into an expected
+**excess return (alpha)** in three steps, following the lecture notes (L5):
+
+1. **Standardise the signal cross-sectionally** into a z-score each month, so it has mean 0 and
+   standard deviation 1 across the 34 countries:
+   $$z_{i,t}=\frac{\text{mom}_{i,t}-\overline{\text{mom}}_{\cdot,t}}{\mathrm{std}_t(\text{mom})}.$$
+   This makes the signal scale-free and centres the bets (the average alpha is ~0, so it is a relative
+   view, not a market call).
+2. **Scale by skill and risk** using the **fundamental law of active management**,
+   $\hat\alpha_i=\mathrm{IC}\cdot\sigma_{resid}\cdot z_i$:
+   * **IC = 0.02** (given) is the *information coefficient* - the assumed correlation between our signal
+     and realised returns. A small number, reflecting that momentum is a weak predictor.
+   * **$\sigma_{resid}$** is the residual return volatility. Per the task wording we use a **single
+     scalar** = the cross-sectional mean of the 34 countries' volatilities over the last 60 months.
+     It sets the *magnitude* of alphas in return units.
+
+   Intuition: $\hat\alpha = (\text{how much we believe the signal})\times(\text{how much return is at
+   stake})\times(\text{the standardised view})$.
+
+### 3.2 Estimating risk and solving for weights
+* At each month $t\ge 61$ we take the **most recent 60 monthly returns** and compute the **sample
+  covariance matrix** $\Sigma_t$ (34$\times$34).
+* We solve the **constrained mean-variance / CRRA** problem, identical to `smm921_pfOpt.py`:
+  $$\max_w\; w'\hat\alpha-\tfrac{\lambda}{2}\,w'\Sigma_t w
+  \quad\text{s.t.}\quad \mathbf{1}'w=1,\qquad \lambda=4.$$
+  The closed-form solution (Lagrange multiplier $\gamma$ enforcing the budget constraint) is
+  $$\gamma=\frac{\hat\alpha'\Sigma^{-1}\mathbf{1}-\lambda}{\mathbf{1}'\Sigma^{-1}\mathbf{1}},
+  \qquad w=\frac{1}{\lambda}\,\Sigma^{-1}\bigl(\hat\alpha-\gamma\mathbf{1}\bigr).$$
+* $\lambda=4$ is the **risk-aversion** coefficient (given): higher $\lambda$ ⇒ the optimiser trades less
+  aggressively on alpha for a given amount of variance.
+
+We then record the realised portfolio return over month $t\!+\!1$, roll forward one month, and repeat.
+The first window uses returns 1-60, so the first backtested return is **month 61** (as required).
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:40.990304Z', iopub.status.busy: '2026-06-05T11:29:40.989673Z', iopub.status.idle: '2026-06-05T11:29:41.625447Z', shell.execute_reply: '2026-06-05T11:29:41.623818Z'}
+pr_s, W_s, d_s = an.run_optimisation(rets, sig, robust=False)
+print('Optimised (sample cov) months:', pr_s.shape[0],
+      '| first:', pr_s.index.min().date(), '| last:', pr_s.index.max().date())
+an.summary_stats(pr_s).round(3)
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:41.629315Z', iopub.status.busy: '2026-06-05T11:29:41.628712Z', iopub.status.idle: '2026-06-05T11:29:42.071255Z', shell.execute_reply: '2026-06-05T11:29:42.069820Z'}
+fig, ax = plt.subplots(1, 2, figsize=(13,5))
+ax[0].plot((1+pr_s.fillna(0)).cumprod()); ax[0].set_yscale('log')
+ax[0].set_title('Optimised portfolio - cumulative wealth (sample cov)')
+ax[1].plot(d_s.index, d_s['gross']); ax[1].set_title('Gross leverage (sum |w|)')
+ax[1].axhline(1, color='r', lw=.6, ls='--'); plt.tight_layout(); plt.show()
+print('Avg gross leverage: %.1f x | avg monthly turnover: %.2f' %
+      (d_s['gross'].mean(), d_s['turnover'].mean()))
+```
+
+### 3.3 Reading the results - and why it disappoints
+Economically the optimiser **underperforms badly**: a Sharpe of only ~**0.11** with an annualised
+volatility around **46%**, despite our risk aversion of 4. The diagnostics in the right-hand plot reveal
+the culprit - **average gross leverage of ~20x** ($\sum_i|w_i|\approx 20$), i.e. enormous long and short
+positions that almost cancel.
+
+This is the textbook **"error-maximisation"** failure of mean-variance optimisation:
+* With **34 assets but only 60 observations**, the sample covariance matrix is **ill-conditioned**
+  (near-singular). Its smallest eigenvalues are tiny and *poorly estimated*.
+* The optimiser uses $\Sigma^{-1}$, which **divides by** those tiny eigenvalues - so it pours capital
+  into the directions the data measures *least* reliably, building giant offsetting bets that look
+  low-risk in-sample but are pure estimation noise out-of-sample.
+* The result is unstable, highly levered weights and a wrecked Sharpe.
+
+The point is subtle but important: **the alpha is fine; the risk model is the problem.** That motivates
+Part 4, where we keep everything identical except for a more robust $\Sigma$.
+
+## 4. Robust covariance: constant-correlation (Elton-Gruber)
+
+### 4.1 The idea
+The fragility in Part 3 comes entirely from the **correlations**: with 34 assets there are
+$34\times33/2=561$ distinct pairwise correlations to estimate from only 60 months - hopeless. The
+**variances** (34 numbers) are estimated far more reliably. The **Elton-Gruber constant-correlation
+model** exploits exactly this: keep what you can estimate well, throw away what you can't.
+
+**Construction** (per the manager's instruction): take the sample matrix $\Sigma_t$, then
+1. **Keep the variances** (the diagonal $D=\mathrm{diag}(\sigma_1,\dots,\sigma_{34})$) unchanged.
+2. **Replace every pairwise correlation with a single number** - the **average off-diagonal
+   correlation** $\bar\rho$ implied by the sample matrix:
+   $$\bar\rho=\frac{1}{N(N-1)}\sum_{i\ne j}\rho_{ij},\qquad
+   R_{cc}=\begin{cases}1 & i=j\\ \bar\rho & i\ne j\end{cases}.$$
+3. **Rebuild** $\;\Sigma^{cc}_t=D\,R_{cc}\,D.$
+
+This is a **heavy shrinkage**: 561 noisy correlations collapse to one well-estimated average. The
+resulting matrix is far better conditioned, so $\Sigma^{-1}$ no longer explodes. Everything else in the
+optimisation (alphas, $\lambda=4$, the budget constraint, the walk-forward loop) is **byte-for-byte
+identical** - the *only* change is how we model correlations.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:42.074907Z', iopub.status.busy: '2026-06-05T11:29:42.074401Z', iopub.status.idle: '2026-06-05T11:29:42.680435Z', shell.execute_reply: '2026-06-05T11:29:42.678542Z'}
+pr_r, W_r, d_r = an.run_optimisation(rets, sig, robust=True)
+opt = pd.concat([pr_s, pr_r], axis=1)
+an.summary_stats(opt).round(3)
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-06-05T11:29:42.683940Z', iopub.status.busy: '2026-06-05T11:29:42.683530Z', iopub.status.idle: '2026-06-05T11:29:43.168143Z', shell.execute_reply: '2026-06-05T11:29:43.166751Z'}
+fig, ax = plt.subplots(1, 2, figsize=(13,5))
+cw = (1+opt.fillna(0)).cumprod()
+ax[0].plot(cw.index, cw['OPT_SAMPLE'], label='Sample cov')
+ax[0].plot(cw.index, cw['OPT_ROBUST'], label='Robust (const-corr)')
+ax[0].set_yscale('log'); ax[0].legend(); ax[0].set_title('Cumulative wealth: sample vs robust')
+ax[1].plot(d_s.index, d_s['gross'], label='Sample', alpha=.8)
+ax[1].plot(d_r.index, d_r['gross'], label='Robust', alpha=.8)
+ax[1].set_title('Gross leverage'); ax[1].legend(); plt.tight_layout(); plt.show()
+print('Gross leverage  sample %.1fx  robust %.1fx' % (d_s['gross'].mean(), d_r['gross'].mean()))
+print('Turnover        sample %.2f   robust %.2f'  % (d_s['turnover'].mean(), d_r['turnover'].mean()))
+```
+
+### 4.2 Reading the comparison
+The summary table and the two plots put the sample-cov and robust-cov backtests **side by side, with
+identical alphas and risk aversion**. The improvement is dramatic:
+
+| Metric | Sample cov | Robust (const-corr) |
+|---|---|---|
+| Annualised mean | ~4.9% | ~16.6% |
+| Annualised vol | ~46% | ~36% |
+| **Sharpe** | **~0.11** | **~0.47** |
+| Max drawdown | ~-84% | ~-67% |
+| Avg gross leverage | ~20x | ~7x |
+| Avg monthly turnover | ~8.4 | ~2.7 |
+
+Stabilising the covariance matrix more than **quadruples the Sharpe**, cuts volatility by roughly a
+quarter, and - crucially for a real desk - **slashes leverage and turnover** (so far lower transaction
+costs and margin). The cumulative-wealth chart shows the robust line compounding steadily where the
+sample line lurches around.
+
+## 5. Inference & recommendation
+* **Robust covariance dominates, decisively.** The single change from a noisy 561-parameter correlation
+  matrix to one average correlation lifts Sharpe from ~0.11 to ~0.47, tames volatility, and cuts gross
+  leverage (~20x → ~7x) and turnover (~8 → ~3). Same alphas, same $\lambda$ - **only $\Sigma$ changed.**
+* **Why it works.** With 34 assets and 60 observations the sample correlation matrix is severely
+  over-fit and ill-conditioned; inverting it amplifies estimation noise into giant offsetting positions
+  ("error maximisation"). Constant-correlation shrinkage keeps the well-estimated piece (variances) and
+  discards the unreliable piece (hundreds of pairwise correlations), so the optimiser's weights track
+  the **alpha signal instead of the noise**.
+* **On the signal itself.** Raw country momentum is weak as a stand-alone trade (Part 2), yet inside a
+  *risk-controlled* optimiser with a *stable* covariance matrix it still adds real value. **The lesson:
+  for a global cross-country book, disciplined risk estimation matters more than the raw strength of the
+  alpha.**
+
+**Recommendation:** adopt the **constant-correlation (Elton-Gruber) covariance** for the momentum
+optimisation. As natural next steps I would (i) benchmark it against **Ledoit-Wolf shrinkage** and a
+**single-factor (world-market) risk model**, (ii) add explicit **leverage and turnover constraints** to
+control trading costs, and (iii) **validate the IC out-of-sample** before committing risk capital.
+
